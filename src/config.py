@@ -1,4 +1,4 @@
-"""Central configuration for PyForge."""
+"""Central configuration and Google Cloud Secret Manager integration for PyForge."""
 
 from __future__ import annotations
 
@@ -14,6 +14,43 @@ warnings.filterwarnings("ignore", message=r".*LibreSSL.*")
 load_dotenv()
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+
+class SecretManagerResolver:
+    """Secure secret loader supporting Google Cloud Secret Manager and environment injection."""
+
+    @staticmethod
+    def get_secret(
+        env_var: str = "GOOGLE_API_KEY",
+        fallback_env_var: str = "GEMINI_API_KEY",
+        secret_id_env: str = "PYFORGE_GCP_SECRET_ID",
+    ) -> str:
+        """Resolve an API secret from environment injection or Google Cloud Secret Manager.
+
+        Never uses hardcoded credentials. Checks injected environment variables first,
+        then queries Google Cloud Secret Manager if `GOOGLE_CLOUD_PROJECT` is configured.
+        """
+        direct_value = os.getenv(env_var) or os.getenv(fallback_env_var)
+        if direct_value:
+            return direct_value
+
+        project_id = os.getenv("GOOGLE_CLOUD_PROJECT") or os.getenv("GCP_PROJECT_ID")
+        secret_id = os.getenv(secret_id_env, "pyforge-gemini-api-key")
+        if not project_id:
+            return ""
+
+        try:
+            # Optional dynamic import for Google Cloud Secret Manager client
+            from google.cloud import secretmanager  # type: ignore[import-untyped]
+
+            client = secretmanager.SecretManagerServiceClient()
+            resource_name = (
+                f"projects/{project_id}/secrets/{secret_id}/versions/latest"
+            )
+            response = client.access_secret_version(request={"name": resource_name})
+            return response.payload.data.decode("utf-8").strip()
+        except Exception:
+            return ""
 
 
 @dataclass(frozen=True)
@@ -33,9 +70,9 @@ class PyForgeConfig:
         )
     )
 
-    # Model settings
+    # Model settings (Pro for architectural planning, Flash for fast coding/compaction)
     google_api_key: str = field(
-        default_factory=lambda: os.getenv("GOOGLE_API_KEY", os.getenv("GEMINI_API_KEY", ""))
+        default_factory=SecretManagerResolver.get_secret
     )
     architect_model: str = field(
         default_factory=lambda: os.getenv("PYFORGE_ARCHITECT_MODEL", "gemini-2.5-pro")
@@ -60,4 +97,3 @@ class PyForgeConfig:
 
 
 DEFAULT_CONFIG = PyForgeConfig()
-

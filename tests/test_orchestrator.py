@@ -189,6 +189,27 @@ def test_sliding_window_memory_compacts_when_budget_exceeded() -> None:
     assert "### Conversation Summary" in memory.get_context_string()
 
 
+def test_sliding_window_memory_async_background_worker() -> None:
+    """SlidingWindowMemory async worker should consolidate older messages in the background without blocking."""
+    memory = SlidingWindowMemory(
+        max_messages=4,
+        api_key="",
+        custom_summarizer=lambda older, prev: f"AsyncSummary({len(older)} turns)",
+    )
+
+    async def _run_async_memory() -> None:
+        await memory.start_worker()
+        for i in range(6):
+            await memory.add_message_async("user", f"Async turn {i}")
+        await memory.wait_for_compaction()
+        await memory.stop_worker()
+
+    asyncio.run(_run_async_memory())
+    assert len(memory.messages) <= 4
+    assert "AsyncSummary(" in memory.system_summary
+
+
+
 def test_architect_response_schema_is_gemini_api_compatible() -> None:
     """ArchitectAgent.RESPONSE_SCHEMA must serialize for Gemini API without additionalProperties errors."""
     from google.genai import Client, models, types

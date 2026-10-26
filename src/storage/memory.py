@@ -1,8 +1,9 @@
-"""Sliding-window conversation memory with automatic Gemini-backed compaction."""
+"""Sliding-window conversation memory with non-blocking asynchronous background compaction."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import asyncio
+from dataclasses import dataclass
 from typing import Callable
 
 from google import genai
@@ -22,7 +23,7 @@ class ConversationMessage:
 
 
 class SlidingWindowMemory:
-    """Maintains a bounded window of recent messages and compacts older turns into a summary."""
+    """Maintains a bounded window of recent messages and compacts older turns asynchronously."""
 
     def __init__(
         self,
@@ -42,6 +43,16 @@ class SlidingWindowMemory:
 
         self.system_summary: str = ""
         self.messages: list[ConversationMessage] = []
+        self._compaction_queue: asyncio.Queue[list[ConversationMessage] | None] | None = None
+        self._worker_task: asyncio.Task[None] | None = None
+        self._background_tasks: set[asyncio.Task[None]] = set()
+        self._lock: asyncio.Lock | None = None
+
+    def _get_lock(self) -> asyncio.Lock:
+        """Lazily initialize asyncio.Lock within the active event loop."""
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
 
     @staticmethod
     def estimate_tokens(text: str) -> int:
@@ -55,48 +66,171 @@ class SlidingWindowMemory:
             total += self.estimate_tokens(msg.content)
         return total
 
-    def add_message(self, role: str, content: str) -> None:
-        """Add a message to memory and compact older messages if budget is exceeded."""
+    def _exceeds_budget(self) -> bool:
+        """Return True if message count or token budget exceeds configured thresholds."""
+        return (
+            len(self.messages) > self.max_messages
+            or self.total_estimated_tokens() > self.max_token_budget
+        )
+
+    async def start_worker(self) -> None:
+        """Start the background asyncio.Queue compaction worker to prevent UI blocking."""
+        if self._worker_task is not None and not self._worker_task.done():
+            return
+        self._compaction_queue = asyncio.Queue()
+        self._worker_task = asyncio.create_task(self._compaction_worker())
+        default_logger.info(
+            layer="memory",
+            intent="start_async_compaction_worker",
+            outcome="started",
+            metadata={"max_messages": self.max_messages},
+        )
+
+    async def stop_worker(self) -> None:
+        """Drain pending background compactions and stop the async worker."""
+        if self._background_tasks:
+            await asyncio.gather(*list(self._background_tasks), return_exceptions=True)
+        if self._compaction_queue is not None and self._worker_task is not None:
+            await self._compaction_queue.put(None)
+            await self._worker_task
+            self._worker_task = None
+            self._compaction_queue = None
+            self._lock = None
+            default_logger.info(
+                layer="memory",
+                intent="stop_async_compaction_worker",
+                outcome="stopped",
+            )
+
+    async def _compaction_worker(self) -> None:
+        """Background worker that consolidates older dialogue batches asynchronously."""
+        assert self._compaction_queue is not None
+        while True:
+            batch = await self._compaction_queue.get()
+            if batch is None:
+                self._compaction_queue.task_done()
+                break
+            try:
+                async with self._get_lock():
+                    new_summary = await self._summarize_turns_async(
+                        batch, self.system_summary
+                    )
+                    self.system_summary = PIIScrubber.scrub(new_summary)
+                    default_logger.info(
+                        layer="memory",
+                        intent="async_compact_sliding_window",
+                        outcome="compacted",
+                        metadata={
+                            "compacted_turns": len(batch),
+                            "remaining_turns": len(self.messages),
+                            "summary_length": len(self.system_summary),
+                        },
+                    )
+            except Exception as exc:
+                default_logger.error(
+                    layer="memory",
+                    intent="async_compact_sliding_window",
+                    outcome="error",
+                    metadata={"error": str(exc)},
+                )
+            finally:
+                self._compaction_queue.task_done()
+
+    def _slice_for_compaction(self) -> list[ConversationMessage]:
+        """Slice oldest messages out of the active window for background consolidation."""
+        keep_count = max(1, self.max_messages // 2)
+        if len(self.messages) <= keep_count:
+            return []
+        to_summarize = self.messages[:-keep_count]
+        self.messages = self.messages[-keep_count:]
+        return to_summarize
+
+    async def add_message_async(self, role: str, content: str) -> None:
+        """Add a message and trigger non-blocking asynchronous background compaction."""
         clean_content = PIIScrubber.scrub(content)
         self.messages.append(ConversationMessage(role=role, content=clean_content))
 
-        if (
-            len(self.messages) > self.max_messages
-            or self.total_estimated_tokens() > self.max_token_budget
-        ):
-            self._compact()
+        if self._exceeds_budget():
+            to_summarize = self._slice_for_compaction()
+            if not to_summarize:
+                return
+            if (
+                self._compaction_queue is not None
+                and self._worker_task is not None
+                and not self._worker_task.done()
+            ):
+                await self._compaction_queue.put(to_summarize)
+            else:
+                task = asyncio.create_task(self._compact_batch_async(to_summarize))
+                self._background_tasks.add(task)
+                task.add_done_callback(self._background_tasks.discard)
 
-    def _compact(self) -> None:
-        """Compact the oldest messages into `self.system_summary`."""
-        keep_count = max(1, self.max_messages // 2)
-        if len(self.messages) <= keep_count:
-            return
+    async def _compact_batch_async(
+        self, to_summarize: list[ConversationMessage]
+    ) -> None:
+        """Consolidate a batch of older messages asynchronously without blocking UI."""
+        async with self._get_lock():
+            new_summary = await self._summarize_turns_async(
+                to_summarize, self.system_summary
+            )
+            self.system_summary = PIIScrubber.scrub(new_summary)
+            default_logger.info(
+                layer="memory",
+                intent="async_compact_sliding_window",
+                outcome="compacted",
+                metadata={
+                    "compacted_turns": len(to_summarize),
+                    "remaining_turns": len(self.messages),
+                    "summary_length": len(self.system_summary),
+                },
+            )
 
-        to_summarize = self.messages[:-keep_count]
-        self.messages = self.messages[-keep_count:]
+    async def wait_for_compaction(self) -> None:
+        """Await all in-flight asynchronous memory compaction tasks."""
+        if self._compaction_queue is not None:
+            await self._compaction_queue.join()
+        if self._background_tasks:
+            await asyncio.gather(*list(self._background_tasks), return_exceptions=True)
 
-        new_summary = self._summarize_turns(to_summarize, self.system_summary)
-        self.system_summary = PIIScrubber.scrub(new_summary)
+    def add_message(self, role: str, content: str) -> None:
+        """Add a message to memory and schedule background async compaction if budget exceeded."""
+        clean_content = PIIScrubber.scrub(content)
+        self.messages.append(ConversationMessage(role=role, content=clean_content))
 
-        default_logger.info(
-            layer="memory",
-            intent="compact_sliding_window",
-            outcome="compacted",
-            metadata={
-                "compacted_turns": len(to_summarize),
-                "remaining_turns": len(self.messages),
-                "summary_length": len(self.system_summary),
-            },
-        )
+        if self._exceeds_budget():
+            to_summarize = self._slice_for_compaction()
+            if not to_summarize:
+                return
+            try:
+                loop = asyncio.get_running_loop()
+                if (
+                    self._compaction_queue is not None
+                    and self._worker_task is not None
+                    and not self._worker_task.done()
+                ):
+                    loop.call_soon_threadsafe(
+                        self._compaction_queue.put_nowait, to_summarize
+                    )
+                else:
+                    task = loop.create_task(self._compact_batch_async(to_summarize))
+                    self._background_tasks.add(task)
+                    task.add_done_callback(self._background_tasks.discard)
+            except RuntimeError:
+                # No running event loop in current thread; run async compaction via asyncio.run
+                self._lock = None
+                asyncio.run(self._compact_batch_async(to_summarize))
+                self._lock = None
 
-    def _summarize_turns(
+    async def _summarize_turns_async(
         self,
         older_messages: list[ConversationMessage],
         existing_summary: str,
     ) -> str:
-        """Summarize older dialogue turns using `gemini-2.5-flash` (or fallback when offline)."""
+        """Asynchronously summarize older dialogue turns using Gemini async client (`client.aio`)."""
         if self.custom_summarizer is not None:
-            return self.custom_summarizer(older_messages, existing_summary)
+            return await asyncio.to_thread(
+                self.custom_summarizer, older_messages, existing_summary
+            )
 
         formatted_turns = "\n".join(
             f"{msg.role.upper()}: {msg.content}" for msg in older_messages
@@ -113,7 +247,7 @@ class SlidingWindowMemory:
                     prompt += f"Existing Summary:\n{existing_summary}\n\n"
                 prompt += f"Older Dialogue Turns:\n{formatted_turns}"
 
-                response = client.models.generate_content(
+                response = await client.aio.models.generate_content(
                     model=self.summarizer_model,
                     contents=prompt,
                     config=types.GenerateContentConfig(
@@ -125,12 +259,21 @@ class SlidingWindowMemory:
             except Exception as exc:
                 default_logger.warning(
                     layer="memory",
-                    intent="gemini_summarize_turns",
+                    intent="gemini_async_summarize_turns",
                     outcome="fallback_local_summary",
                     metadata={"error": str(exc)},
                 )
 
-        # Deterministic local fallback compaction
+        return await asyncio.to_thread(
+            self._local_fallback_summary, older_messages, existing_summary
+        )
+
+    @staticmethod
+    def _local_fallback_summary(
+        older_messages: list[ConversationMessage],
+        existing_summary: str,
+    ) -> str:
+        """Deterministic fallback summary when offline or no API key is configured."""
         snippets = [
             f"[{m.role}] {m.content[:160].strip()}" for m in older_messages
         ]
@@ -150,4 +293,3 @@ class SlidingWindowMemory:
             )
             sections.append(f"### Recent Messages\n{turns}")
         return "\n\n".join(sections)
-

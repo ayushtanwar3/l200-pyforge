@@ -1,4 +1,6 @@
-"""PyForgeOrchestrator coordinating the Architect, Coder, AST Guardrail, Sandbox, and HITL Gate."""
+"""PyForgeOrchestrator implementing Coordinator & Sequential multi-agent patterns,
+Strategic Model Routing, Guardrail & Self-Evaluation Policy Plugins, and HITL hooks.
+"""
 
 from __future__ import annotations
 
@@ -9,6 +11,7 @@ from typing import Callable
 from src.agents.architect import ArchitectAgent
 from src.agents.coder import CoderAgent
 from src.agents.constitution import CONSTITUTION
+from src.agents.model_router import StrategicModelRouter, TaskComplexity
 from src.config import DEFAULT_CONFIG
 from src.observability.ast_guardrail import (
     ASTSecurityVisitor,
@@ -22,6 +25,39 @@ from src.storage.memory import SlidingWindowMemory
 from src.tools.hitl_gate import HITLDecision, HITLOutcome, HumanInTheLoopGate
 from src.tools.sandbox_runner import SandboxTestRunner
 from src.tools.schemas import SandboxBatchResult, ScriptSpecification
+
+
+class GuardrailPolicyPlugin:
+    """Composable security and self-evaluation guardrail policy plugin.
+
+    Enforces:
+    1. Static AST Security Policy (`ASTSecurityVisitor`)
+    2. Immutable Agent Constitution Policy (`CONSTITUTION.check_raw_violations`)
+    3. Automated Self-Evaluation Policy (`SandboxTestRunner` against `TestVector` suite)
+    """
+
+    def __init__(self, sandbox_runner: SandboxTestRunner) -> None:
+        self.sandbox_runner = sandbox_runner
+
+    def evaluate_security(self, code: str) -> SecurityValidationResult:
+        """Execute static AST and Constitution policy guardrails on generated code."""
+        with telemetry.trace_ast_check():
+            ast_check = ASTSecurityVisitor.validate(code)
+            raw_violations = CONSTITUTION.check_raw_violations(code)
+            all_violations = [*ast_check.violations, *raw_violations]
+            return SecurityValidationResult(
+                is_safe=len(all_violations) == 0,
+                violations=all_violations,
+            )
+
+    def evaluate_test_vectors(
+        self, code: str, spec: ScriptSpecification
+    ) -> SandboxBatchResult:
+        """Execute automated self-evaluation against specification test vectors."""
+        return self.sandbox_runner.run_tests(
+            code=code,
+            test_vectors=spec.test_vectors,
+        )
 
 
 @dataclass
@@ -40,7 +76,7 @@ class OrchestrationResult:
 
 
 class PyForgeOrchestrator:
-    """Coordinates specification design, coding, static AST safety, sandbox testing, and self-healing."""
+    """Coordinator & Sequential multi-agent orchestrator with strategic routing and self-healing."""
 
     def __init__(
         self,
@@ -51,14 +87,28 @@ class PyForgeOrchestrator:
         hitl_gate: HumanInTheLoopGate | None = None,
         database: SQLiteDatabase | None = None,
         memory: SlidingWindowMemory | None = None,
+        model_router: StrategicModelRouter | None = None,
+        guardrail_plugin: GuardrailPolicyPlugin | None = None,
         max_healing_iterations: int = DEFAULT_CONFIG.max_healing_iterations,
     ) -> None:
-        self.architect = architect or ArchitectAgent()
-        self.coder = coder or CoderAgent()
+        self.model_router = model_router or StrategicModelRouter()
+        self.architect = architect or ArchitectAgent(
+            model=self.model_router.select_model(TaskComplexity.PLANNING)
+        )
+        self.coder = coder or CoderAgent(
+            model=self.model_router.select_model(TaskComplexity.FAST_EXECUTION)
+        )
         self.sandbox_runner = sandbox_runner or SandboxTestRunner()
+        self.guardrail_plugin = guardrail_plugin or GuardrailPolicyPlugin(
+            self.sandbox_runner
+        )
         self.hitl_gate = hitl_gate or HumanInTheLoopGate()
         self.database = database or SQLiteDatabase()
-        self.memory = memory or SlidingWindowMemory()
+        self.memory = memory or SlidingWindowMemory(
+            summarizer_model=self.model_router.select_model(
+                TaskComplexity.FAST_EXECUTION
+            )
+        )
         self.max_healing_iterations = max_healing_iterations
 
     def run(
@@ -70,14 +120,14 @@ class PyForgeOrchestrator:
     ) -> OrchestrationResult:
         """Execute the full PyForge workflow with up to `max_healing_iterations` self-healing retries.
 
-        Workflow Steps:
+        Workflow Steps (Sequential + Coordinator Pattern):
         1. Scrub input prompt through `PIIScrubber`.
-        2. Query `ArchitectAgent` to generate `ScriptSpecification`.
-        3. Query `CoderAgent` to generate Python code.
-        4. Run `ASTSecurityVisitor`. If violations found, re-prompt Coder with violation report.
-        5. Run `SandboxTestRunner` against test vectors.
+        2. Route planning request to `ArchitectAgent` (`gemini-2.5-pro`) to generate `ScriptSpecification`.
+        3. Route coding request to `CoderAgent` (`gemini-2.5-flash`) to generate Python code.
+        4. Run `GuardrailPolicyPlugin.evaluate_security` (`ASTSecurityVisitor` + Constitution).
+        5. Run `GuardrailPolicyPlugin.evaluate_test_vectors` (`SandboxTestRunner`).
         6. Self-Healing Loop: Up to 3 automated healing iterations on AST or sandbox failure.
-        7. Invoke `HumanInTheLoopGate` when all tests pass and security is clear.
+        7. Invoke `HumanInTheLoopGate` hook requiring explicit confirmation before disk installation.
         8. Persist script and session state in SQLite.
         """
         notify = status_callback or (lambda _msg: None)
@@ -96,8 +146,9 @@ class PyForgeOrchestrator:
             metadata={"session_id": session_id},
         )
 
-        # Step 2: Query ArchitectAgent to generate ScriptSpecification
-        notify("Architect (gemini-2.5-pro) designing CLI specification & test vectors...")
+        # Step 2: Strategic Model Routing -> ArchitectAgent (Planning / Pro)
+        planning_model = self.model_router.select_model(TaskComplexity.PLANNING)
+        notify(f"Architect ({planning_model}) designing CLI specification & test vectors...")
         context_str = self.memory.get_context_string()
         spec = self.architect.generate_specification(
             user_request=scrubbed_request,
@@ -106,7 +157,8 @@ class PyForgeOrchestrator:
         history.append(f"Specification generated for '{spec.tool_name}'.")
         self.memory.add_message("assistant", spec.model_dump_json())
 
-        # Step 3-6: Coding, AST Security Check, Sandbox Execution, and Self-Healing Loop
+        # Step 3-6: Strategic Model Routing -> CoderAgent (Flash), Guardrails & Self-Healing Loop
+        execution_model = self.model_router.select_model(TaskComplexity.FAST_EXECUTION)
         previous_code: str | None = None
         error_feedback: str | None = None
         code = ""
@@ -123,11 +175,11 @@ class PyForgeOrchestrator:
                     )
                     notify(
                         f"Self-healing iteration {attempt}/{self.max_healing_iterations} "
-                        f"with Coder (gemini-2.5-flash)..."
+                        f"with Coder ({execution_model})..."
                     )
                 else:
                     notify(
-                        f"Coder (gemini-2.5-flash) generating '{spec.tool_name}.py'..."
+                        f"Coder ({execution_model}) generating '{spec.tool_name}.py'..."
                     )
 
                 code = self.coder.generate_code(
@@ -136,16 +188,9 @@ class PyForgeOrchestrator:
                     error_feedback=error_feedback,
                 )
 
-                # Step 4: Run ASTSecurityVisitor + Constitution check
+                # Step 4: Guardrail Policy Plugin — Static AST & Constitution Security Check
                 notify("Running static AST security guardrail...")
-                with telemetry.trace_ast_check():
-                    ast_check = ASTSecurityVisitor.validate(code)
-                    raw_violations = CONSTITUTION.check_raw_violations(code)
-                    all_violations = [*ast_check.violations, *raw_violations]
-                    security_result = SecurityValidationResult(
-                        is_safe=len(all_violations) == 0,
-                        violations=all_violations,
-                    )
+                security_result = self.guardrail_plugin.evaluate_security(code)
 
                 if not security_result.is_safe:
                     telemetry.ast_violations_counter.add(
@@ -180,13 +225,13 @@ class PyForgeOrchestrator:
                     )
                     continue
 
-                # Step 5: Run SandboxTestRunner against test vectors
+                # Step 5: Guardrail Policy Plugin — Self-Evaluation in Isolated Sandbox
                 notify(
                     f"Executing {len(spec.test_vectors)} test vector(s) in isolated sandbox..."
                 )
-                sandbox_result = self.sandbox_runner.run_tests(
+                sandbox_result = self.guardrail_plugin.evaluate_test_vectors(
                     code=code,
-                    test_vectors=spec.test_vectors,
+                    spec=spec,
                 )
 
                 if sandbox_result.all_passed:
@@ -248,7 +293,7 @@ class PyForgeOrchestrator:
                     history=history,
                 )
 
-            # Step 7: Human-in-the-Loop Gate
+            # Step 7: Human-in-the-Loop Gate (Explicit confirmation before installation)
             hitl_outcome: HITLOutcome = self.hitl_gate.review_and_install(
                 spec=spec,
                 code=code,
@@ -257,7 +302,6 @@ class PyForgeOrchestrator:
             )
 
             if hitl_outcome.decision == HITLDecision.EDIT:
-                # Re-enter Coder generation with user's edit request
                 history.append(
                     f"User requested edit: {hitl_outcome.edit_feedback}"
                 )
@@ -320,4 +364,3 @@ class PyForgeOrchestrator:
                 installed_path=None,
                 history=history,
             )
-
