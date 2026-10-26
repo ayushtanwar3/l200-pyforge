@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pyforge"
+version = "0.1.0"
+description = "Autonomous multi-agent CLI tool studio that designs, codes, statically checks, tests, and self-heals single-file Python CLI utilities."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "google-genai>=0.1.1",
+    "pydantic>=2.0.0",
+    "opentelemetry-api>=1.20.0",
+    "opentelemetry-sdk>=1.20.0",
+    "rich>=13.0.0",
+    "pytest>=8.0.0",
+    "python-dotenv>=1.0.0",
+]
+
+[project.scripts]
+pyforge = "src.cli:main"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+filterwarnings = [
+    "ignore::FutureWarning:google.*",
+    "ignore::DeprecationWarning:google.*",
+    "ignore:.*LibreSSL.*",
+]
+
